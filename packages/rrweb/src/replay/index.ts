@@ -190,6 +190,10 @@ export class Replayer {
       mouseTail: defaultMouseTailConfig,
       useVirtualDom: true, // Virtual-dom optimization is enabled by default.
       logger: console,
+      onError: (e: Error) => {
+        // maintain the original behaviour of throwing any otherwise unhandled errors
+        throw e;
+      },
     };
     this.config = Object.assign({}, defaultConfig, config);
 
@@ -1070,299 +1074,308 @@ export class Replayer {
     isSync: boolean,
   ) {
     const { data: d } = e;
-    switch (d.source) {
-      case IncrementalSource.Mutation: {
-        try {
-          this.applyMutation(d, isSync);
-        } catch (error) {
-          // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/restrict-template-expressions
-          this.warn(`Exception in mutation ${error.message || error}`, d);
-        }
-        break;
-      }
-      case IncrementalSource.Drag:
-      case IncrementalSource.TouchMove:
-      case IncrementalSource.MouseMove:
-        if (isSync) {
-          const lastPosition = d.positions[d.positions.length - 1];
-          this.mousePos = {
-            x: lastPosition.x,
-            y: lastPosition.y,
-            id: lastPosition.id,
-            debugData: d,
-          };
-        } else {
-          d.positions.forEach((p) => {
-            const action = {
-              doAction: () => {
-                this.moveAndHover(p.x, p.y, p.id, isSync, d);
-              },
-              delay:
-                p.timeOffset +
-                e.timestamp -
-                this.service.state.context.baselineTime,
-            };
-            this.timer.addAction(action);
-          });
-          // add a dummy action to keep timer alive
-          this.timer.addAction({
-            doAction() {
-              //
-            },
-            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-            delay: e.delay! - d.positions[0]?.timeOffset,
-          });
-        }
-        break;
-      case IncrementalSource.MouseInteraction: {
-        /**
-         * Same as the situation of missing input target.
-         */
-        if (d.id === -1) {
-          break;
-        }
-        const event = new Event(toLowerCase(MouseInteractions[d.type]));
-        const target = this.mirror.getNode(d.id);
-        if (!target) {
-          return this.debugNodeNotFound(d, d.id);
-        }
-        this.emitter.emit(ReplayerEvents.MouseInteraction, {
-          type: d.type,
-          target,
-        });
-        const { triggerFocus } = this.config;
-        switch (d.type) {
-          case MouseInteractions.Blur:
-            if ('blur' in (target as HTMLElement)) {
-              (target as HTMLElement).blur();
-            }
-            break;
-          case MouseInteractions.Focus:
-            if (triggerFocus && (target as HTMLElement).focus) {
-              (target as HTMLElement).focus({
-                preventScroll: true,
-              });
-            }
-            break;
-          case MouseInteractions.Click:
-          case MouseInteractions.TouchStart:
-          case MouseInteractions.TouchEnd:
-          case MouseInteractions.MouseDown:
-          case MouseInteractions.MouseUp:
-            if (isSync) {
-              if (d.type === MouseInteractions.TouchStart) {
-                this.touchActive = true;
-              } else if (d.type === MouseInteractions.TouchEnd) {
-                this.touchActive = false;
-              }
-              if (d.type === MouseInteractions.MouseDown) {
-                this.lastMouseDownEvent = [target, event];
-              } else if (d.type === MouseInteractions.MouseUp) {
-                this.lastMouseDownEvent = null;
-              }
-              this.mousePos = {
-                x: d.x,
-                y: d.y,
-                id: d.id,
-                debugData: d,
-              };
-            } else {
-              if (d.type === MouseInteractions.TouchStart) {
-                // don't draw a trail as user has lifted finger and is placing at a new point
-                this.tailPositions.length = 0;
-              }
-              this.moveAndHover(d.x, d.y, d.id, isSync, d);
-              if (d.type === MouseInteractions.Click) {
-                /*
-                 * don't want target.click() here as could trigger an iframe navigation
-                 * instead any effects of the click should already be covered by mutations
-                 */
-                /*
-                 * removal and addition of .active class (along with void line to trigger repaint)
-                 * triggers the 'click' css animation in styles/style.css
-                 */
-                this.mouse.classList.remove('active');
-                void this.mouse.offsetWidth;
-                this.mouse.classList.add('active');
-              } else if (d.type === MouseInteractions.TouchStart) {
-                void this.mouse.offsetWidth; // needed for the position update of moveAndHover to apply without the .touch-active transition
-                this.mouse.classList.add('touch-active');
-              } else if (d.type === MouseInteractions.TouchEnd) {
-                this.mouse.classList.remove('touch-active');
-              } else {
-                // for MouseDown & MouseUp also invoke default behavior
-                target.dispatchEvent(event);
-              }
-            }
-            break;
-          case MouseInteractions.TouchCancel:
-            if (isSync) {
-              this.touchActive = false;
-            } else {
-              this.mouse.classList.remove('touch-active');
-            }
-            break;
-          default:
-            target.dispatchEvent(event);
-        }
-        break;
-      }
-      case IncrementalSource.Scroll: {
-        /**
-         * Same as the situation of missing input target.
-         */
-        if (d.id === -1) {
-          break;
-        }
-        if (this.usingVirtualDom) {
-          const target = this.virtualDom.mirror.getNode(d.id) as RRElement;
-          if (!target) {
-            return this.debugNodeNotFound(d, d.id);
-          }
-          target.scrollData = d;
-          break;
-        }
-        // Use isSync rather than this.usingVirtualDom because not every fast-forward process uses virtual dom optimization.
-        this.applyScroll(d, isSync);
-        break;
-      }
-      case IncrementalSource.ViewportResize:
-        this.emitter.emit(ReplayerEvents.Resize, {
-          width: d.width,
-          height: d.height,
-        });
-        break;
-      case IncrementalSource.Input: {
-        /**
-         * Input event on an unserialized node usually means the event
-         * was synchrony triggered programmatically after the node was
-         * created. This means there was not an user observable interaction
-         * and we do not need to replay it.
-         */
-        if (d.id === -1) {
-          break;
-        }
-        if (this.usingVirtualDom) {
-          const target = this.virtualDom.mirror.getNode(d.id) as RRElement;
-          if (!target) {
-            return this.debugNodeNotFound(d, d.id);
-          }
-          target.inputData = d;
-          break;
-        }
-        this.applyInput(d);
-        break;
-      }
-      case IncrementalSource.MediaInteraction: {
-        const target = this.usingVirtualDom
-          ? this.virtualDom.mirror.getNode(d.id)
-          : this.mirror.getNode(d.id);
-        if (!target) {
-          return this.debugNodeNotFound(d, d.id);
-        }
-        const mediaEl = target as HTMLMediaElement | RRMediaElement;
-        try {
-          if (d.currentTime !== undefined) {
-            mediaEl.currentTime = d.currentTime;
-          }
-          if (d.volume !== undefined) {
-            mediaEl.volume = d.volume;
-          }
-          if (d.muted !== undefined) {
-            mediaEl.muted = d.muted;
-          }
-          if (d.type === MediaInteractions.Pause) {
-            mediaEl.pause();
-          }
-          if (d.type === MediaInteractions.Play) {
-            // remove listener for 'canplay' event because play() is async and returns a promise
-            // i.e. media will evntualy start to play when data is loaded
-            // 'canplay' event fires even when currentTime attribute changes which may lead to
-            // unexpeted behavior
-            void mediaEl.play();
-          }
-          if (d.type === MediaInteractions.RateChange) {
-            mediaEl.playbackRate = d.playbackRate;
-          }
-        } catch (error) {
-          this.warn(
+    try {
+      switch (d.source) {
+        case IncrementalSource.Mutation: {
+          try {
+            this.applyMutation(d, isSync);
+          } catch (error) {
             // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/restrict-template-expressions
-            `Failed to replay media interactions: ${error.message || error}`,
-          );
-        }
-        break;
-      }
-      case IncrementalSource.StyleSheetRule:
-      case IncrementalSource.StyleDeclaration: {
-        if (this.usingVirtualDom) {
-          if (d.styleId) this.constructedStyleMutations.push(d);
-          else if (d.id)
-            (
-              this.virtualDom.mirror.getNode(d.id) as RRStyleElement | null
-            )?.rules.push(d);
-        } else this.applyStyleSheetMutation(d);
-        break;
-      }
-      case IncrementalSource.CanvasMutation: {
-        if (!this.config.UNSAFE_replayCanvas) {
-          return;
-        }
-        if (this.usingVirtualDom) {
-          const target = this.virtualDom.mirror.getNode(
-            d.id,
-          ) as RRCanvasElement;
-          if (!target) {
-            return this.debugNodeNotFound(d, d.id);
+            this.warn(`Exception in mutation ${error.message || error}`, d);
           }
-          target.canvasMutations.push({
-            event: e as canvasEventWithTime,
-            mutation: d,
-          });
-        } else {
+          break;
+        }
+        case IncrementalSource.Drag:
+        case IncrementalSource.TouchMove:
+        case IncrementalSource.MouseMove:
+          if (isSync) {
+            const lastPosition = d.positions[d.positions.length - 1];
+            this.mousePos = {
+              x: lastPosition.x,
+              y: lastPosition.y,
+              id: lastPosition.id,
+              debugData: d,
+            };
+          } else {
+            d.positions.forEach((p) => {
+              const action = {
+                doAction: () => {
+                  this.moveAndHover(p.x, p.y, p.id, isSync, d);
+                },
+                delay:
+                  p.timeOffset +
+                  e.timestamp -
+                  this.service.state.context.baselineTime,
+              };
+              this.timer.addAction(action);
+            });
+            // add a dummy action to keep timer alive
+            this.timer.addAction({
+              doAction() {
+                //
+              },
+              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+              delay: e.delay! - d.positions[0]?.timeOffset,
+            });
+          }
+          break;
+        case IncrementalSource.MouseInteraction: {
+          /**
+           * Same as the situation of missing input target.
+           */
+          if (d.id === -1) {
+            break;
+          }
+          const event = new Event(toLowerCase(MouseInteractions[d.type]));
           const target = this.mirror.getNode(d.id);
           if (!target) {
             return this.debugNodeNotFound(d, d.id);
           }
-          void canvasMutation({
-            event: e,
-            mutation: d,
-            target: target as HTMLCanvasElement,
-            imageMap: this.imageMap,
-            canvasEventMap: this.canvasEventMap,
-            errorHandler: this.warnCanvasMutationFailed.bind(this),
+          this.emitter.emit(ReplayerEvents.MouseInteraction, {
+            type: d.type,
+            target,
           });
-        }
-        break;
-      }
-      case IncrementalSource.Font: {
-        try {
-          const fontFace = new FontFace(
-            d.family,
-            d.buffer
-              ? new Uint8Array(JSON.parse(d.fontSource) as Iterable<number>)
-              : d.fontSource,
-            d.descriptors,
-          );
-          this.iframe.contentDocument?.fonts.add(fontFace);
-        } catch (error) {
-          this.warn(error);
-        }
-        break;
-      }
-      case IncrementalSource.Selection: {
-        if (isSync) {
-          this.lastSelectionData = d;
+          const { triggerFocus } = this.config;
+          switch (d.type) {
+            case MouseInteractions.Blur:
+              if ('blur' in (target as HTMLElement)) {
+                (target as HTMLElement).blur();
+              }
+              break;
+            case MouseInteractions.Focus:
+              if (triggerFocus && (target as HTMLElement).focus) {
+                (target as HTMLElement).focus({
+                  preventScroll: true,
+                });
+              }
+              break;
+            case MouseInteractions.Click:
+            case MouseInteractions.TouchStart:
+            case MouseInteractions.TouchEnd:
+            case MouseInteractions.MouseDown:
+            case MouseInteractions.MouseUp:
+              if (isSync) {
+                if (d.type === MouseInteractions.TouchStart) {
+                  this.touchActive = true;
+                } else if (d.type === MouseInteractions.TouchEnd) {
+                  this.touchActive = false;
+                }
+                if (d.type === MouseInteractions.MouseDown) {
+                  this.lastMouseDownEvent = [target, event];
+                } else if (d.type === MouseInteractions.MouseUp) {
+                  this.lastMouseDownEvent = null;
+                }
+                this.mousePos = {
+                  x: d.x,
+                  y: d.y,
+                  id: d.id,
+                  debugData: d,
+                };
+              } else {
+                if (d.type === MouseInteractions.TouchStart) {
+                  // don't draw a trail as user has lifted finger and is placing at a new point
+                  this.tailPositions.length = 0;
+                }
+                this.moveAndHover(d.x, d.y, d.id, isSync, d);
+                if (d.type === MouseInteractions.Click) {
+                  /*
+                   * don't want target.click() here as could trigger an iframe navigation
+                   * instead any effects of the click should already be covered by mutations
+                   */
+                  /*
+                   * removal and addition of .active class (along with void line to trigger repaint)
+                   * triggers the 'click' css animation in styles/style.css
+                   */
+                  this.mouse.classList.remove('active');
+                  void this.mouse.offsetWidth;
+                  this.mouse.classList.add('active');
+                } else if (d.type === MouseInteractions.TouchStart) {
+                  void this.mouse.offsetWidth; // needed for the position update of moveAndHover to apply without the .touch-active transition
+                  this.mouse.classList.add('touch-active');
+                } else if (d.type === MouseInteractions.TouchEnd) {
+                  this.mouse.classList.remove('touch-active');
+                } else {
+                  // for MouseDown & MouseUp also invoke default behavior
+                  target.dispatchEvent(event);
+                }
+              }
+              break;
+            case MouseInteractions.TouchCancel:
+              if (isSync) {
+                this.touchActive = false;
+              } else {
+                this.mouse.classList.remove('touch-active');
+              }
+              break;
+            default:
+              target.dispatchEvent(event);
+          }
           break;
         }
-        this.applySelection(d);
-        break;
+        case IncrementalSource.Scroll: {
+          /**
+           * Same as the situation of missing input target.
+           */
+          if (d.id === -1) {
+            break;
+          }
+          if (this.usingVirtualDom) {
+            const target = this.virtualDom.mirror.getNode(d.id) as RRElement;
+            if (!target) {
+              return this.debugNodeNotFound(d, d.id);
+            }
+            target.scrollData = d;
+            break;
+          }
+          // Use isSync rather than this.usingVirtualDom because not every fast-forward process uses virtual dom optimization.
+          this.applyScroll(d, isSync);
+          break;
+        }
+        case IncrementalSource.ViewportResize:
+          this.emitter.emit(ReplayerEvents.Resize, {
+            width: d.width,
+            height: d.height,
+          });
+          break;
+        case IncrementalSource.Input: {
+          /**
+           * Input event on an unserialized node usually means the event
+           * was synchrony triggered programmatically after the node was
+           * created. This means there was not an user observable interaction
+           * and we do not need to replay it.
+           */
+          if (d.id === -1) {
+            break;
+          }
+          if (this.usingVirtualDom) {
+            const target = this.virtualDom.mirror.getNode(d.id) as RRElement;
+            if (!target) {
+              return this.debugNodeNotFound(d, d.id);
+            }
+            target.inputData = d;
+            break;
+          }
+          this.applyInput(d);
+          break;
+        }
+        case IncrementalSource.MediaInteraction: {
+          const target = this.usingVirtualDom
+            ? this.virtualDom.mirror.getNode(d.id)
+            : this.mirror.getNode(d.id);
+          if (!target) {
+            return this.debugNodeNotFound(d, d.id);
+          }
+          const mediaEl = target as HTMLMediaElement | RRMediaElement;
+          try {
+            if (d.currentTime !== undefined) {
+              mediaEl.currentTime = d.currentTime;
+            }
+            if (d.volume !== undefined) {
+              mediaEl.volume = d.volume;
+            }
+            if (d.muted !== undefined) {
+              mediaEl.muted = d.muted;
+            }
+            if (d.type === MediaInteractions.Pause) {
+              mediaEl.pause();
+            }
+            if (d.type === MediaInteractions.Play) {
+              // remove listener for 'canplay' event because play() is async and returns a promise
+              // i.e. media will evntualy start to play when data is loaded
+              // 'canplay' event fires even when currentTime attribute changes which may lead to
+              // unexpeted behavior
+              void mediaEl.play();
+            }
+            if (d.type === MediaInteractions.RateChange) {
+              mediaEl.playbackRate = d.playbackRate;
+            }
+          } catch (error) {
+            this.warn(
+              // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/restrict-template-expressions
+              `Failed to replay media interactions: ${error.message || error}`,
+            );
+          }
+          break;
+        }
+        case IncrementalSource.StyleSheetRule:
+        case IncrementalSource.StyleDeclaration: {
+          if (this.usingVirtualDom) {
+            if (d.styleId) this.constructedStyleMutations.push(d);
+            else if (d.id)
+              (
+                this.virtualDom.mirror.getNode(d.id) as RRStyleElement | null
+              )?.rules.push(d);
+          } else this.applyStyleSheetMutation(d);
+          break;
+        }
+        case IncrementalSource.CanvasMutation: {
+          if (!this.config.UNSAFE_replayCanvas) {
+            return;
+          }
+          if (this.usingVirtualDom) {
+            const target = this.virtualDom.mirror.getNode(
+              d.id,
+            ) as RRCanvasElement;
+            if (!target) {
+              return this.debugNodeNotFound(d, d.id);
+            }
+            target.canvasMutations.push({
+              event: e as canvasEventWithTime,
+              mutation: d,
+            });
+          } else {
+            const target = this.mirror.getNode(d.id);
+            if (!target) {
+              return this.debugNodeNotFound(d, d.id);
+            }
+            void canvasMutation({
+              event: e,
+              mutation: d,
+              target: target as HTMLCanvasElement,
+              imageMap: this.imageMap,
+              canvasEventMap: this.canvasEventMap,
+              errorHandler: this.warnCanvasMutationFailed.bind(this),
+            });
+          }
+          break;
+        }
+        case IncrementalSource.Font: {
+          try {
+            const fontFace = new FontFace(
+              d.family,
+              d.buffer
+                ? new Uint8Array(JSON.parse(d.fontSource) as Iterable<number>)
+                : d.fontSource,
+              d.descriptors,
+            );
+            this.iframe.contentDocument?.fonts.add(fontFace);
+          } catch (error) {
+            this.warn(error);
+          }
+          break;
+        }
+        case IncrementalSource.Selection: {
+          if (isSync) {
+            this.lastSelectionData = d;
+            break;
+          }
+          this.applySelection(d);
+          break;
+        }
+        case IncrementalSource.AdoptedStyleSheet: {
+          if (this.usingVirtualDom) this.adoptedStyleSheets.push(d);
+          else this.applyAdoptedStyleSheet(d);
+          break;
+        }
+        default:
       }
-      case IncrementalSource.AdoptedStyleSheet: {
-        if (this.usingVirtualDom) this.adoptedStyleSheets.push(d);
-        else this.applyAdoptedStyleSheet(d);
-        break;
+    } catch (e) {
+      const onError = this.config.onError;
+      if (onError) {
+        onError(e as Error);
+      } else {
+        throw e;
       }
-      default:
     }
   }
 

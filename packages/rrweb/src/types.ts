@@ -193,6 +193,7 @@ export type playerConfig = {
     warn: (...args: Parameters<typeof console.warn>) => void;
   };
   plugins?: ReplayPlugin[];
+  onError?: (e: Error) => void;
 };
 
 export type missingNode = {
